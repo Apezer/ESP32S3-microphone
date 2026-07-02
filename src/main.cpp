@@ -65,9 +65,78 @@ static int16_t audio_buffer[DMA_BUF_LEN];
 static int16_t peak_value = 0;
 static int16_t rms_value = 0;
 
-// 低通滤波器状态 (IIR 一阶, 截止频率 ~4kHz)
-static float lp_alpha = 0.39f;   // 2*pi*4000/16000 算出
-static float lp_prev = 0.0f;
+// ===== 音频处理链 (参考小智 AFE 处理思路) =====
+
+// 1. DC 偏移去除 (高通, 截止 ~20Hz)
+static float dc_x1 = 0, dc_y1 = 0;
+
+// 2. 二阶带通滤波器 (Butterworth, 300Hz~3.4kHz)
+//    由高通(300Hz) + 低通(3.4kHz) 串联组成
+// 高通 300Hz
+static float hp_x1 = 0, hp_x2 = 0, hp_y1 = 0, hp_y2 = 0;
+// 低通 3.4kHz
+static float lp_x1 = 0, lp_x2 = 0, lp_y1 = 0, lp_y2 = 0;
+
+// 3. 滞回噪声门限 (防止门限附近咔嗒声)
+static bool gate_open = false;
+static const int16_t GATE_OPEN_THRESH  = 400;   // 开门阈值 (需要更大信号才开门)
+static const int16_t GATE_CLOSE_THRESH = 200;   // 关门阈值 (更小信号才关门)
+static const int16_t GATE_OUTPUT = 0;            // 门关闭时输出值
+
+// DC 偏移去除 (一阶高通 IIR, fc=20Hz)
+// y[n] = 0.999 * (y[n-1] + x[n] - x[n-1])
+inline int16_t removeDC(int16_t x) {
+    float xf = (float)x;
+    float y = 0.999f * (dc_y1 + xf - dc_x1);
+    dc_x1 = xf;
+    dc_y1 = y;
+    return (int16_t)y;
+}
+
+// 二阶 Butterworth 高通, fc=300Hz, fs=16kHz
+// 系数由 MATLAB/Python butter(2, 300/8000, 'high') 计算
+inline int16_t highpass300(int16_t x) {
+    static const float b0 = 0.8631f, b1 = -1.7262f, b2 = 0.8631f;
+    static const float a1 = -1.7237f, a2 = 0.7287f;
+    float xf = (float)x;
+    float y = b0*xf + b1*hp_x1 + b2*hp_x2 - a1*hp_y1 - a2*hp_y2;
+    hp_x2 = hp_x1; hp_x1 = xf;
+    hp_y2 = hp_y1; hp_y1 = y;
+    if (y > 32767) y = 32767;
+    if (y < -32768) y = -32768;
+    return (int16_t)y;
+}
+
+// 二阶 Butterworth 低通, fc=3.4kHz, fs=16kHz
+inline int16_t lowpass3400(int16_t x) {
+    static const float b0 = 0.1341f, b1 = 0.2682f, b2 = 0.1341f;
+    static const float a1 = -0.7265f, a2 = 0.2630f;
+    float xf = (float)x;
+    float y = b0*xf + b1*lp_x1 + b2*lp_x2 - a1*lp_y1 - a2*lp_y2;
+    lp_x2 = lp_x1; lp_x1 = xf;
+    lp_y2 = lp_y1; lp_y1 = y;
+    if (y > 32767) y = 32767;
+    if (y < -32768) y = -32768;
+    return (int16_t)y;
+}
+
+// 完整音频处理链
+inline int16_t processSample(int16_t x) {
+    // 1. 去除 DC 偏移
+    x = removeDC(x);
+    // 2. 高通 300Hz (去除低频嗡嗡声)
+    x = highpass300(x);
+    // 3. 低通 3.4kHz (去除高频电流声)
+    x = lowpass3400(x);
+    // 4. 滞回噪声门限
+    int16_t absx = abs(x);
+    if (!gate_open && absx > GATE_OPEN_THRESH) {
+        gate_open = true;
+    } else if (gate_open && absx < GATE_CLOSE_THRESH) {
+        gate_open = false;
+    }
+    return gate_open ? x : GATE_OUTPUT;
+}
 
 // ===== I2S 麦克风初始化 =====
 bool initMicrophone() {
@@ -538,19 +607,9 @@ void loop() {
             peak_value = peak;
             rms_value = (int16_t)sqrt(sum_sq / samples);
 
-            // 低通滤波 + 噪声门限
-            static const int16_t NOISE_GATE = 300;
+            // 音频处理链: DC去除 → 带通滤波 → 噪声门限
             for (int i = 0; i < samples; i++) {
-                // IIR 低通滤波器: 滤除高频电流噪声
-                float x = (float)audio_buffer[i];
-                lp_prev = lp_alpha * x + (1.0f - lp_alpha) * lp_prev;
-                int16_t filtered = (int16_t)lp_prev;
-
-                // 噪声门限
-                if (abs(filtered) < NOISE_GATE) {
-                    filtered = 0;
-                }
-                audio_buffer[i] = filtered;
+                audio_buffer[i] = processSample(audio_buffer[i]);
             }
 
             // WebSocket 推送
