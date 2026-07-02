@@ -65,6 +65,10 @@ static int16_t audio_buffer[DMA_BUF_LEN];
 static int16_t peak_value = 0;
 static int16_t rms_value = 0;
 
+// 低通滤波器状态 (IIR 一阶, 截止频率 ~4kHz)
+static float lp_alpha = 0.39f;   // 2*pi*4000/16000 算出
+static float lp_prev = 0.0f;
+
 // ===== I2S 麦克风初始化 =====
 bool initMicrophone() {
     i2s_config_t i2s_config = {};
@@ -175,6 +179,13 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     width: 100%; transition: background 0.2s;
   }
   button:hover { background: #1d4ed8; }
+  button.rec { background: #16a34a; }
+  button.rec:hover { background: #15803d; }
+  button.recording { background: #dc2626; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: 0.7; } }
+  .btn-row { display: flex; gap: 10px; margin-bottom: 8px; }
+  .btn-row button { flex: 1; }
+  .rec-info { font-size: 12px; color: #f59e0b; min-height: 18px; margin-bottom: 8px; }
   .meter-wrap {
     margin: 20px 0; background: #0f172a; border-radius: 8px;
     height: 24px; overflow: hidden; position: relative;
@@ -204,7 +215,11 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     <input type="range" id="gain" min="1" max="20" value="5">
     <span class="gain-val" id="gainVal">5x</span>
   </div>
-  <button id="btn" onclick="toggle()">开始收听</button>
+  <div class="btn-row">
+    <button id="btn" onclick="toggle()">开始收听</button>
+    <button id="recBtn" class="rec" onclick="toggleRec()" disabled>录音</button>
+  </div>
+  <div class="rec-info" id="recInfo"></div>
   <p class="info">
     采样率: 16000 Hz | 单声道 16-bit<br>
     连接 WiFi: <b>ESP32-Mic</b> / 12345678
@@ -213,6 +228,12 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <script>
 let ws, audioCtx, playing = false;
 let gainNode, meterEl, gainSlider, gainValEl;
+
+// 录音相关
+let recording = false;
+let recChunks = [];
+let recStartTime = 0;
+let recTimer = null;
 
 function initAudio() {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
@@ -223,6 +244,10 @@ function initAudio() {
 
 function playSamples(int16arr) {
   if (!audioCtx) return;
+  // 录音时保存原始 PCM 数据
+  if (recording) {
+    recChunks.push(new Int16Array(int16arr));
+  }
   const float32 = new Float32Array(int16arr.length);
   for (let i = 0; i < int16arr.length; i++) {
     float32[i] = int16arr[i] / 32768.0;
@@ -259,6 +284,7 @@ function start() {
   ws.onopen = () => {
     playing = true;
     btn.textContent = '停止收听';
+    document.getElementById('recBtn').disabled = false;
     st.textContent = '已连接 - 正在传输';
     st.className = 'connected';
   };
@@ -283,14 +309,127 @@ function start() {
 }
 
 function stop() {
+  if (recording) stopRec();
   playing = false;
   if (ws) { ws.close(); ws = null; }
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   document.getElementById('btn').textContent = '开始收听';
+  document.getElementById('recBtn').disabled = true;
   const st = document.getElementById('status');
   st.textContent = '已停止';
   st.className = '';
   if (meterEl) meterEl.style.width = '0%';
+}
+
+// ===== 录音功能 =====
+function toggleRec() {
+  if (recording) stopRec(); else startRec();
+}
+
+function startRec() {
+  recording = true;
+  recChunks = [];
+  recStartTime = Date.now();
+  const btn = document.getElementById('recBtn');
+  btn.textContent = '停止录音';
+  btn.className = 'recording';
+  updateRecInfo();
+  recTimer = setInterval(updateRecInfo, 500);
+}
+
+function updateRecInfo() {
+  const sec = ((Date.now() - recStartTime) / 1000).toFixed(1);
+  const samples = recChunks.reduce((s, c) => s + c.length, 0);
+  const sizeKB = (samples * 2 / 1024).toFixed(1);
+  document.getElementById('recInfo').textContent =
+    '录音中 ' + sec + 's | ' + sizeKB + ' KB';
+}
+
+function stopRec() {
+  recording = false;
+  clearInterval(recTimer);
+  const btn = document.getElementById('recBtn');
+  btn.textContent = '录音';
+  btn.className = 'rec';
+
+  if (recChunks.length === 0) {
+    document.getElementById('recInfo').textContent = '无录音数据';
+    return;
+  }
+
+  // 合并所有 PCM 块
+  let totalLen = 0;
+  for (const c of recChunks) totalLen += c.length;
+  const pcm = new Int16Array(totalLen);
+  let offset = 0;
+  for (const c of recChunks) {
+    pcm.set(c, offset);
+    offset += c.length;
+  }
+  recChunks = [];
+
+  // 生成 WAV 文件
+  const wav = encodeWAV(pcm, 16000);
+  const blob = new Blob([wav], { type: 'audio/wav' });
+  const url = URL.createObjectURL(blob);
+
+  // 下载
+  const a = document.createElement('a');
+  const sec = ((Date.now() - recStartTime) / 1000).toFixed(1);
+  a.href = url;
+  a.download = 'recording_' + Date.now() + '.wav';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  const sizeKB = (blob.size / 1024).toFixed(1);
+  document.getElementById('recInfo').textContent =
+    '已保存: ' + sec + 's, ' + sizeKB + ' KB';
+}
+
+function encodeWAV(samples, sampleRate) {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  const blockAlign = numChannels * bitsPerSample / 8;
+  const dataSize = samples.length * (bitsPerSample / 8);
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  // RIFF header
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(view, 8, 'WAVE');
+
+  // fmt chunk
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);          // chunk size
+  view.setUint16(20, 1, true);           // PCM format
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+
+  // data chunk
+  writeString(view, 36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  // PCM data
+  let pos = 44;
+  for (let i = 0; i < samples.length; i++) {
+    view.setInt16(pos, samples[i], true);
+    pos += 2;
+  }
+
+  return view;
+}
+
+function writeString(view, offset, str) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
 }
 
 window.onload = () => {
@@ -399,12 +538,19 @@ void loop() {
             peak_value = peak;
             rms_value = (int16_t)sqrt(sum_sq / samples);
 
-            // 噪声门限
+            // 低通滤波 + 噪声门限
             static const int16_t NOISE_GATE = 300;
             for (int i = 0; i < samples; i++) {
-                if (abs(audio_buffer[i]) < NOISE_GATE) {
-                    audio_buffer[i] = 0;
+                // IIR 低通滤波器: 滤除高频电流噪声
+                float x = (float)audio_buffer[i];
+                lp_prev = lp_alpha * x + (1.0f - lp_alpha) * lp_prev;
+                int16_t filtered = (int16_t)lp_prev;
+
+                // 噪声门限
+                if (abs(filtered) < NOISE_GATE) {
+                    filtered = 0;
                 }
+                audio_buffer[i] = filtered;
             }
 
             // WebSocket 推送
