@@ -119,22 +119,20 @@ void updateOled() {
 
     // 峰值电平条
     int bar_y = 14;
-    int bar_h = 20;
-    drawBar(4, bar_y, 120, bar_h, peak_value, 16000);
+    int bar_h = 14;
+    drawBar(4, bar_y, 90, bar_h, peak_value, 16000);
 
     // 峰值数字
-    oled.setCursor(4, bar_y + bar_h + 4);
-    oled.setTextSize(2);
+    oled.setCursor(98, bar_y + 3);
     oled.printf("%5d", peak_value);
-    oled.setTextSize(1);
 
     // RMS 电平条
-    int rms_y = bar_y + bar_h + 22;
-    drawBar(4, rms_y, 120, 10, rms_value, 8000);
-    oled.setCursor(100, rms_y + 12);
+    int rms_y = bar_y + bar_h + 4;
+    drawBar(4, rms_y, 90, 10, rms_value, 8000);
+    oled.setCursor(98, rms_y + 1);
     oled.print("RMS");
 
-    // 底部状态: WiFi 客户端数
+    // 底部状态
     oled.setCursor(0, 56);
     oled.printf("Clients:%d  16kHz", ws.count());
 
